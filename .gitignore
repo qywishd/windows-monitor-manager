@@ -1,0 +1,33 @@
+# Project-specific
+.claude/
+.monitormanager/
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+*.lnk
+
+# Test temporary directories
+**/MonitorManager.SafeTests.*/
+
+# PowerShell
+*.ps1xml
+*.psm1
+
+# IDE / Editor
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# OS
+.DS_Store
