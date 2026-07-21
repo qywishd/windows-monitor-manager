@@ -1,4 +1,4 @@
-$tokens = $null
+﻿$tokens = $null
 $errors = $null
 $file = Join-Path $PSScriptRoot 'MonitorManager.ps1'
 [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors) | Out-Null
