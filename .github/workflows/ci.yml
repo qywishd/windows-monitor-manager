@@ -15,26 +15,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: PowerShell version
-        shell: powershell
+      - name: PowerShell 7 version
+        shell: pwsh
         run: $PSVersionTable.PSVersion
 
-      - name: Syntax check
+      - name: PowerShell 7 tests
+        shell: pwsh
+        run: |
+          .\check_syntax.ps1
+          .\safe_tests.ps1
+          .\MonitorManager.ps1 help
+          .\MonitorManager.ps1 list
+
+      - name: Windows PowerShell 5.1 compatibility
         shell: powershell
         run: |
+          $PSVersionTable.PSVersion
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\check_syntax.ps1
-
-      - name: Safe tests
-        shell: powershell
-        run: |
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\safe_tests.ps1
-
-      - name: Help command (read-only)
-        shell: powershell
-        run: |
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\MonitorManager.ps1 help
-
-      - name: List command (read-only)
-        shell: powershell
-        run: |
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\MonitorManager.ps1 list

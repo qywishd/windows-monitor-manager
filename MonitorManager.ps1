@@ -4,8 +4,8 @@
 .DESCRIPTION
     功能：
       1. 识别已连接的显示器（分辨率、刷新率、颜色深度）
-      2. 针对多显示器配置保存模板
-      3. 快速切换模板（GUI / CLI / 交互菜单）
+      2. 针对单台显示器保存参数模板
+      3. 保存并一键切换完整的多显示器场景
       4. 桌面快捷方式
       5. 单独连接或断开显示器（GUI / CLI，等同 Windows“扩展桌面/断开此显示器”）
 .EXAMPLE
@@ -16,6 +16,8 @@
     .\MonitorManager.ps1 apply 工作   命令行：应用模板
     .\MonitorManager.ps1 disconnect 2 命令行：断开 2 号显示器
     .\MonitorManager.ps1 connect 2    命令行：连接 2 号显示器
+    .\MonitorManager.ps1 scene-save 办公  保存当前多显示器场景
+    .\MonitorManager.ps1 scene-apply 办公 应用多显示器场景
     .\MonitorManager.ps1 shortcut     创建桌面快捷方式
 #>
 
@@ -392,9 +394,10 @@ $DpiScaleToPixels = @{
 
 $TemplateDir  = Join-Path $env:USERPROFILE ".monitormanager"
 $TemplateFile = Join-Path $TemplateDir "templates.json"
+$SceneFile = Join-Path $TemplateDir "scenes.json"
 $MonitorNamesFile = Join-Path $TemplateDir "monitor_names.json"
 
-# 多实例会同时读写模板并可能同时提交显示模式。使用当前用户范围的命名互斥锁，
+# 多实例会同时读写用户数据并可能同时提交显示模式。使用当前用户范围的命名互斥锁，
 # 将“读取→修改→保存”和显示器配置提交分别串行化。
 try { $CurrentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { $CurrentUserSid = $env:USERNAME }
 $DataMutexName = "Local\MonitorManager.Data.$CurrentUserSid"
@@ -1319,6 +1322,158 @@ function Save-Templates {
     }
 }
 
+# 多显示器场景与单显示器参数模板分文件保存，避免升级时改变已有 templates.json 的结构。
+# 场景记录物理 target 身份、启用状态，以及启用显示器的模式参数。
+function New-EmptySceneData {
+    return [PSCustomObject]@{ version = 1; scenes = @() }
+}
+
+function Assert-SceneDataValid {
+    param($Data)
+
+    if ($null -eq $Data -or -not ($Data -is [PSCustomObject])) {
+        throw '场景文件的根节点必须是 JSON 对象'
+    }
+    if ($null -eq $Data.PSObject.Properties['version'] -or [int]$Data.version -ne 1) {
+        throw '场景文件版本无效'
+    }
+    if ($null -eq $Data.PSObject.Properties['scenes'] -or $null -eq $Data.scenes) {
+        throw '场景文件缺少 scenes 节点'
+    }
+
+    $sceneNames = @{}
+    foreach ($scene in @($Data.scenes)) {
+        if ($null -eq $scene -or -not ($scene -is [PSCustomObject])) { throw '场景文件包含无效记录' }
+        foreach ($field in @('name', 'created', 'monitors')) {
+            if ($null -eq $scene.PSObject.Properties[$field]) { throw "场景记录缺少字段 '$field'" }
+        }
+
+        $sceneName = [string]$scene.name
+        if (-not ($scene.name -is [string]) -or [string]::IsNullOrWhiteSpace($sceneName) -or
+            $sceneName.Length -gt 100 -or $sceneName -match '[\r\n\t]') {
+            throw '场景文件包含无效名称'
+        }
+        if ($sceneNames.ContainsKey($sceneName)) { throw "场景名称 '$sceneName' 重复" }
+        $sceneNames[$sceneName] = $true
+
+        $monitorItems = @($scene.monitors)
+        if ($monitorItems.Count -eq 0) { throw "场景 '$sceneName' 未包含显示器" }
+        $monitorIds = @{}
+        $targetKeys = @{}
+        $activeCount = 0
+        foreach ($item in $monitorItems) {
+            if ($null -eq $item -or -not ($item -is [PSCustomObject])) { throw "场景 '$sceneName' 包含无效显示器记录" }
+            foreach ($field in @('monitorId', 'monitorName', 'targetKey', 'isActive', 'width', 'height', 'refreshRate', 'bitsPerPel', 'dpiScale')) {
+                if ($null -eq $item.PSObject.Properties[$field]) { throw "场景 '$sceneName' 的显示器记录缺少字段 '$field'" }
+            }
+
+            $monitorId = [string]$item.monitorId
+            $targetKey = [string]$item.targetKey
+            if ([string]::IsNullOrWhiteSpace($monitorId) -or $monitorId.Length -gt 1000 -or $monitorId -match '[\r\n\t]') {
+                throw "场景 '$sceneName' 包含无效显示器 ID"
+            }
+            if ([string]::IsNullOrWhiteSpace($targetKey) -or $targetKey.Length -gt 200 -or $targetKey -match '[\r\n\t]') {
+                throw "场景 '$sceneName' 包含无效物理目标 ID"
+            }
+            if ($monitorIds.ContainsKey($monitorId) -or $targetKeys.ContainsKey($targetKey)) {
+                throw "场景 '$sceneName' 包含重复的显示器"
+            }
+            $monitorIds[$monitorId] = $true
+            $targetKeys[$targetKey] = $true
+
+            if (-not ($item.isActive -is [bool])) { throw "场景 '$sceneName' 包含无效连接状态" }
+            if ([bool]$item.isActive) {
+                $activeCount++
+                $width = 0; $height = 0; $refresh = 0; $bpp = 0; $dpi = 0
+                if (-not [int]::TryParse([string]$item.width, [ref]$width) -or $width -le 0 -or
+                    -not [int]::TryParse([string]$item.height, [ref]$height) -or $height -le 0 -or
+                    -not [int]::TryParse([string]$item.refreshRate, [ref]$refresh) -or $refresh -le 0 -or
+                    -not [int]::TryParse([string]$item.bitsPerPel, [ref]$bpp) -or $bpp -le 0) {
+                    throw "场景 '$sceneName' 包含无效显示模式"
+                }
+                if (-not [int]::TryParse([string]$item.dpiScale, [ref]$dpi) -or
+                    ($dpi -ne 0 -and $DpiScaleTable -notcontains $dpi)) {
+                    throw "场景 '$sceneName' 包含无效 DPI 缩放值"
+                }
+            }
+        }
+        if ($activeCount -lt 1) { throw "场景 '$sceneName' 会断开所有显示器，已拒绝加载" }
+    }
+}
+
+function Load-MonitorScenes {
+    param([switch]$ForWrite)
+
+    if (-not (Test-Path -LiteralPath $SceneFile)) { return New-EmptySceneData }
+    try {
+        $data = Get-Content -LiteralPath $SceneFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        Assert-SceneDataValid $data
+        return $data
+    } catch {
+        $timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
+        $backupPath = "$SceneFile.corrupted.$timestamp.bak"
+        $backupSucceeded = $false
+        try {
+            Copy-Item -LiteralPath $SceneFile -Destination $backupPath -Force -ErrorAction Stop
+            $backupSucceeded = Test-Path -LiteralPath $backupPath
+        } catch {
+            Write-Warning "场景文件已损坏，且备份失败: $($_.Exception.Message)"
+        }
+        if ($backupSucceeded) { Write-Warning "场景文件已损坏，已备份至: $backupPath" }
+        if ($ForWrite) {
+            $backupInfo = if ($backupSucceeded) { "备份: $backupPath" } else { '备份未成功' }
+            throw "场景文件损坏，已阻止写入（$backupInfo）"
+        }
+        return New-EmptySceneData
+    }
+}
+
+function Save-MonitorScenes {
+    param($Data)
+
+    $tmpFile = $null
+    try {
+        Assert-SceneDataValid $Data
+        if (-not (Test-Path -LiteralPath $TemplateDir)) {
+            New-Item -Path $TemplateDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        $tmpFile = Join-Path $TemplateDir ("scenes.{0}.{1}.tmp" -f $PID, [Guid]::NewGuid().ToString('N'))
+        $Data | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $tmpFile -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $tmpFile -Destination $SceneFile -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Warning "保存场景失败: $($_.Exception.Message)"
+        if ($tmpFile -and (Test-Path -LiteralPath $tmpFile)) { Remove-Item -LiteralPath $tmpFile -Force -ErrorAction SilentlyContinue }
+        return $false
+    }
+}
+
+function Get-MonitorSceneByName {
+    param($Data, [string]$Name)
+    if (-not $Data -or [string]::IsNullOrWhiteSpace($Name)) { return $null }
+    return ($Data.scenes | Where-Object { [string]$_.name -eq $Name } | Select-Object -First 1)
+}
+
+function Test-MonitorScenesEquivalent {
+    param($First, $Second)
+    if (-not $First -or -not $Second) { return $false }
+    $firstItems = @($First.monitors)
+    $secondItems = @($Second.monitors)
+    if ($firstItems.Count -ne $secondItems.Count) { return $false }
+
+    $secondByMonitorId = @{}
+    foreach ($item in $secondItems) { $secondByMonitorId[[string]$item.monitorId] = $item }
+    foreach ($item in $firstItems) {
+        $other = $secondByMonitorId[[string]$item.monitorId]
+        if (-not $other -or [bool]$item.isActive -ne [bool]$other.isActive) { return $false }
+        if ([bool]$item.isActive -and
+            ([int]$item.width -ne [int]$other.width -or [int]$item.height -ne [int]$other.height -or
+             [int]$item.refreshRate -ne [int]$other.refreshRate -or [int]$item.bitsPerPel -ne [int]$other.bitsPerPel -or
+             [int]$item.dpiScale -ne [int]$other.dpiScale)) { return $false }
+    }
+    return $true
+}
+
 # 获取指定显示器下的所有模板（返回数组）
 function Get-MonitorTemplates {
     param([string]$MonitorId, $Templates)
@@ -1467,6 +1622,44 @@ function Complete-WorkerOutput {
         $detail = $text.Trim()
     }
     Write-WorkerResult -Message $detail
+}
+
+# PowerShell 7 使用独立可执行文件 pwsh.exe；Windows PowerShell 5.1 始终是 powershell.exe。
+# 优先选择稳定安装位置中的 PowerShell 7，找不到时保留系统自带 5.1 作为兼容回退。
+function Get-PreferredPowerShellHostPath {
+    param(
+        [string[]]$PowerShell7Candidates = $null,
+        [string[]]$WindowsPowerShellCandidates = $null
+    )
+
+    if ($null -eq $PowerShell7Candidates) {
+        $PowerShell7Candidates = @()
+        if ($env:ProgramFiles) { $PowerShell7Candidates += (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe') }
+        if ($env:ProgramW6432 -and $env:ProgramW6432 -ne $env:ProgramFiles) {
+            $PowerShell7Candidates += (Join-Path $env:ProgramW6432 'PowerShell\7\pwsh.exe')
+        }
+        if ($env:LOCALAPPDATA) { $PowerShell7Candidates += (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe') }
+        $PowerShell7Candidates += @(Get-Command 'pwsh.exe' -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+    }
+
+    foreach ($candidate in @($PowerShell7Candidates)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return [string](Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+
+    if ($null -eq $WindowsPowerShellCandidates) {
+        $WindowsPowerShellCandidates = @()
+        if ($env:SystemRoot) { $WindowsPowerShellCandidates += (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') }
+        $WindowsPowerShellCandidates += @(Get-Command 'powershell.exe' -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+        try { $WindowsPowerShellCandidates += (Get-Process -Id $PID).Path } catch {}
+    }
+    foreach ($candidate in @($WindowsPowerShellCandidates)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return [string](Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    return 'powershell.exe'
 }
 
 # ============================================================
@@ -1957,7 +2150,13 @@ function Restore-DisplaySnapshot {
 
 # 应用模板到指定显示器
 function Invoke-ApplyTemplateCoreUnlocked {
-    param([string]$MonitorSpec, [string]$TemplateName)
+    param(
+        [string]$MonitorSpec,
+        [string]$TemplateName,
+        $DirectTemplate = $null,
+        $DirectTarget = $null,
+        [string]$OperationLabel = '模板'
+    )
     if ([string]::IsNullOrWhiteSpace($TemplateName)) { return @{ success = $false; error = "请指定模板名称" } }
     if ([string]::IsNullOrWhiteSpace($MonitorSpec)) { return @{ success = $false; error = "请指定显示器（序号/ID/名称）" } }
 
@@ -1973,14 +2172,22 @@ function Invoke-ApplyTemplateCoreUnlocked {
         $currentMonitors = Get-Monitors
         if ($currentMonitors.Count -eq 0) { return @{ success = $false; error = "未检测到显示器" } }
 
-        $target = Resolve-Monitor -Spec $MonitorSpec -Monitors $currentMonitors
+        $target = if ($DirectTarget) {
+            Resolve-MonitorByTargetIdentity -Monitors $currentMonitors -MonitorId ([string]$DirectTarget.MonitorId) -TargetKey (Get-MonitorTargetKey $DirectTarget)
+        } else {
+            Resolve-Monitor -Spec $MonitorSpec -Monitors $currentMonitors
+        }
         if (-not $target) { return @{ success = $false; error = "未找到显示器 '$MonitorSpec'" } }
         if (-not (Test-MonitorIsActive $target)) { return @{ success = $false; error = "显示器 '$($target.MonitorName)' 当前未启用，无法应用模板" } }
 
-        $templates = Load-Templates
-        $monitorTemplates = @(Get-MonitorTemplates -MonitorId $target.MonitorId -Templates $templates)
-        $template = $monitorTemplates | Where-Object { $_.name -eq $TemplateName } | Select-Object -First 1
-        if (-not $template) { return @{ success = $false; error = "显示器 '$($target.DisplayName)' 下未找到模板 '$TemplateName'" } }
+        if ($DirectTemplate) {
+            $template = $DirectTemplate
+        } else {
+            $templates = Load-Templates
+            $monitorTemplates = @(Get-MonitorTemplates -MonitorId $target.MonitorId -Templates $templates)
+            $template = $monitorTemplates | Where-Object { $_.name -eq $TemplateName } | Select-Object -First 1
+            if (-not $template) { return @{ success = $false; error = "显示器 '$($target.DisplayName)' 下未找到模板 '$TemplateName'" } }
+        }
 
         $w = [int]($template.width -as [string])
         $h = [int]($template.height -as [string])
@@ -2135,7 +2342,7 @@ function Invoke-ApplyTemplateCoreUnlocked {
 
         $rollbackEligible = $false
         $message = if ($allSuccess) {
-            "模板 '$TemplateName' 已应用到 $($target.DisplayName) 并完成验证"
+            "$OperationLabel '$TemplateName' 已应用到 $($target.DisplayName) 并完成验证"
         } elseif ($needsRestart) {
             "缩放比例已应用；显示模式需要重启后生效"
         } else {
@@ -2171,6 +2378,369 @@ function Apply-TemplateCore {
         }
     } catch {
         return @{ success = $false; error = "应用模板失败: $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-SaveMonitorSceneCoreUnlocked {
+    param([string]$SceneName)
+
+    $SceneName = ([string]$SceneName).Trim()
+    if ([string]::IsNullOrWhiteSpace($SceneName)) { return @{ success = $false; error = '请指定场景名称' } }
+    if ($SceneName.Length -gt 100 -or $SceneName -match '[\r\n\t]') {
+        return @{ success = $false; error = '场景名称不能超过 100 个字符，也不能包含换行或制表符' }
+    }
+
+    $allMonitors = Get-Monitors
+    $monitors = @($allMonitors | Where-Object { $_.IsConnected })
+    if ($monitors.Count -eq 0) { return @{ success = $false; error = '未检测到已连接的显示器' } }
+    $activeCount = @($monitors | Where-Object { Test-MonitorIsActive $_ }).Count
+    if ($activeCount -lt 1) { return @{ success = $false; error = '当前没有活动显示器，无法保存场景' } }
+
+    $seenTargetKeys = @{}
+    $sceneMonitors = @()
+    foreach ($monitor in $monitors) {
+        $targetKey = Get-MonitorTargetKey $monitor
+        if ([string]::IsNullOrWhiteSpace($targetKey) -or $seenTargetKeys.ContainsKey($targetKey)) {
+            return @{ success = $false; error = '无法唯一识别所有物理显示器，已取消保存场景' }
+        }
+        $seenTargetKeys[$targetKey] = $true
+        $isActive = Test-MonitorIsActive $monitor
+        if ($isActive -and ([int]$monitor.Width -le 0 -or [int]$monitor.Height -le 0 -or
+            [int]$monitor.RefreshRate -le 0 -or [int]$monitor.BitsPerPel -le 0)) {
+            return @{ success = $false; error = "无法读取显示器 '$($monitor.MonitorName)' 的完整显示模式，已取消保存场景" }
+        }
+        if ($isActive -and [int]$monitor.DpiScale -gt 0 -and $DpiScaleTable -notcontains [int]$monitor.DpiScale) {
+            return @{ success = $false; error = "显示器 '$($monitor.MonitorName)' 的缩放比例不受支持，已取消保存场景" }
+        }
+
+        $sceneMonitors += [PSCustomObject]@{
+            monitorId   = [string]$monitor.MonitorId
+            monitorName = [string]$monitor.MonitorName
+            targetKey   = [string]$targetKey
+            isActive    = [bool]$isActive
+            isPrimary   = [bool]$monitor.IsPrimary
+            width       = if ($isActive) { [int]$monitor.Width } else { 0 }
+            height      = if ($isActive) { [int]$monitor.Height } else { 0 }
+            refreshRate = if ($isActive) { [int]$monitor.RefreshRate } else { 0 }
+            bitsPerPel  = if ($isActive) { [int]$monitor.BitsPerPel } else { 0 }
+            dpiScale    = if ($isActive) { [int]$monitor.DpiScale } else { 0 }
+        }
+    }
+
+    $scene = [PSCustomObject]@{
+        name = $SceneName
+        created = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        monitors = @($sceneMonitors)
+    }
+
+    try {
+        return Invoke-WithNamedMutex -Name $DataMutexName -Action {
+            $data = Load-MonitorScenes -ForWrite
+            $duplicate = $data.scenes | Where-Object {
+                [string]$_.name -ne $SceneName -and (Test-MonitorScenesEquivalent -First $_ -Second $scene)
+            } | Select-Object -First 1
+            if ($duplicate) {
+                return @{ success = $false; duplicate = $true; error = "相同配置已保存为场景 '$($duplicate.name)'" }
+            }
+
+            $data.scenes = @($data.scenes | Where-Object { [string]$_.name -ne $SceneName }) + @($scene)
+            if (-not (Save-MonitorScenes $data)) { return @{ success = $false; error = "场景未能写入 $SceneFile" } }
+            return @{ success = $true; name = $SceneName; scene = $scene; activeCount = $activeCount; monitorCount = $monitors.Count }
+        }
+    } catch {
+        return @{ success = $false; error = "保存场景失败: $($_.Exception.Message)" }
+    }
+}
+
+function Save-MonitorSceneCore {
+    param([string]$SceneName)
+    try {
+        return Invoke-WithNamedMutex -Name $DisplayMutexName -TimeoutMs 30000 -Action {
+            Invoke-SaveMonitorSceneCoreUnlocked -SceneName $SceneName
+        }
+    } catch {
+        return @{ success = $false; error = "保存场景失败: $($_.Exception.Message)" }
+    }
+}
+
+# 根据场景和当前 DisplayConfig 构建一次性目标拓扑。场景之外后来接入的活动显示器保持原状，
+# 避免旧场景在用户新增硬件后意外关闭新显示器。
+function Get-MonitorSceneTopologyPlan {
+    param($Scene, $CurrentMonitors, $ActiveTopology, $AllTopology)
+
+    if (-not $Scene -or -not $ActiveTopology.success -or -not $AllTopology.success) {
+        return @{ success = $false; error = '缺少可用的场景或显示拓扑' }
+    }
+
+    $mappings = @()
+    $mappedTargetKeys = @{}
+    foreach ($entry in @($Scene.monitors)) {
+        $target = Resolve-MonitorByTargetIdentity -Monitors $CurrentMonitors -MonitorId ([string]$entry.monitorId) -TargetKey ([string]$entry.targetKey)
+        if (-not $target -or -not $target.IsConnected) {
+            return @{ success = $false; missingMonitor = [string]$entry.monitorName; error = "场景所需显示器 '$($entry.monitorName)' 当前未被系统检测到" }
+        }
+        $actualTargetKey = Get-MonitorTargetKey $target
+        if ([string]::IsNullOrWhiteSpace($actualTargetKey) -or $mappedTargetKeys.ContainsKey($actualTargetKey)) {
+            return @{ success = $false; error = '场景中的显示器无法唯一映射到当前物理目标' }
+        }
+        $mappedTargetKeys[$actualTargetKey] = $true
+        $mappings += [PSCustomObject]@{ Entry = $entry; Target = $target; TargetKey = $actualTargetKey }
+    }
+
+    $desiredTargetKeys = @{}
+    foreach ($monitor in @($CurrentMonitors)) {
+        if (-not $monitor.IsConnected -or -not (Test-MonitorIsActive $monitor)) { continue }
+        $key = Get-MonitorTargetKey $monitor
+        if (-not $mappedTargetKeys.ContainsKey($key)) { $desiredTargetKeys[$key] = $true }
+    }
+    foreach ($mapping in $mappings) {
+        if ([bool]$mapping.Entry.isActive) { $desiredTargetKeys[[string]$mapping.TargetKey] = $true }
+    }
+    if ($desiredTargetKeys.Count -lt 1) {
+        return @{ success = $false; safetyBlocked = $true; error = '场景会断开所有显示器，已阻止应用' }
+    }
+
+    $desiredPaths = @()
+    $addedTargets = @{}
+    $usedSources = @{}
+    # 优先保留当前活动 path，减少 Windows 重排显示源的概率。
+    foreach ($path in @($ActiveTopology.paths)) {
+        $targetKey = Get-DisplayPathTargetKey $path
+        if (-not $desiredTargetKeys.ContainsKey($targetKey) -or $addedTargets.ContainsKey($targetKey)) { continue }
+        $sourceKey = Get-DisplayPathSourceKey $path
+        if ($usedSources.ContainsKey($sourceKey)) { continue }
+        $desiredPaths += $path
+        $addedTargets[$targetKey] = $true
+        $usedSources[$sourceKey] = $true
+    }
+
+    foreach ($targetKey in @($desiredTargetKeys.Keys)) {
+        if ($addedTargets.ContainsKey($targetKey)) { continue }
+        $candidate = $AllTopology.paths | Where-Object {
+            (Get-DisplayPathTargetKey $_) -eq $targetKey -and $_.targetInfo.targetAvailable -and
+            -not $usedSources.ContainsKey((Get-DisplayPathSourceKey $_))
+        } | Select-Object -First 1
+        if (-not $candidate) {
+            return @{
+                success = $false
+                safetyBlocked = $true
+                error = "没有可用于场景切换的独立显示源（目标: $targetKey）；请先在 Windows 显示设置中退出复制模式"
+            }
+        }
+        $desiredPaths += $candidate
+        $addedTargets[$targetKey] = $true
+        $usedSources[(Get-DisplayPathSourceKey $candidate)] = $true
+    }
+
+    if ($desiredPaths.Count -ne $desiredTargetKeys.Count) {
+        return @{ success = $false; error = '无法为场景构建完整且唯一的显示路径' }
+    }
+    return @{
+        success = $true
+        paths = @($desiredPaths)
+        mappings = @($mappings)
+        desiredTargetKeys = @($desiredTargetKeys.Keys)
+        activeCount = $desiredTargetKeys.Count
+    }
+}
+
+function Wait-MonitorSceneState {
+    param([string[]]$ExpectedTargetKeys, [int]$Attempts = 8)
+
+    $expected = @{}
+    foreach ($key in @($ExpectedTargetKeys)) { $expected[[string]$key] = $true }
+    $lastMonitors = @()
+    for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+        if ($attempt -gt 0) { Start-Sleep -Milliseconds 350 }
+        $lastMonitors = Get-Monitors
+        $actual = @{}
+        foreach ($monitor in @($lastMonitors | Where-Object { Test-MonitorIsActive $_ })) {
+            $actual[(Get-MonitorTargetKey $monitor)] = $true
+        }
+        $matches = ($actual.Count -eq $expected.Count)
+        if ($matches) {
+            foreach ($key in @($expected.Keys)) {
+                if (-not $actual.ContainsKey($key)) { $matches = $false; break }
+            }
+        }
+        if ($matches) { return @{ success = $true; monitors = $lastMonitors; activeCount = $actual.Count } }
+    }
+    return @{ success = $false; monitors = $lastMonitors; activeCount = @($lastMonitors | Where-Object { Test-MonitorIsActive $_ }).Count }
+}
+
+function Restore-MonitorSceneSnapshot {
+    param($TopologySnapshot, $DisplaySnapshots)
+
+    $messages = @()
+    $topologyRestore = Restore-DisplayTopology -Snapshot $TopologySnapshot
+    if (-not $topologyRestore.success) {
+        return @{ success = $false; topologyRestored = $false; modesRestored = $false; message = $topologyRestore.message }
+    }
+    $messages += $topologyRestore.message
+    Start-Sleep -Milliseconds 700
+
+    $allModesRestored = $true
+    foreach ($snapshot in @($DisplaySnapshots)) {
+        $latest = Resolve-MonitorByTargetIdentity -Monitors (Get-Monitors) -MonitorId ([string]$snapshot.Monitor.MonitorId) -TargetKey ([string]$snapshot.TargetKey)
+        if (-not $latest -or -not (Test-MonitorIsActive $latest)) {
+            $allModesRestored = $false
+            $messages += "未能重新定位 '$($snapshot.Monitor.MonitorName)' 以恢复显示模式"
+            continue
+        }
+        $restore = Restore-DisplaySnapshot -DisplayName ([string]$latest.DisplayName) -OriginalMode $snapshot.Mode -OriginalMonitor $snapshot.Monitor
+        if (-not $restore.success) { $allModesRestored = $false }
+        $messages += $restore.message
+    }
+    return @{
+        success = $allModesRestored
+        topologyRestored = $true
+        modesRestored = $allModesRestored
+        message = ($messages -join '；')
+    }
+}
+
+function Invoke-ApplyMonitorSceneCoreUnlocked {
+    param([string]$SceneName)
+
+    $SceneName = ([string]$SceneName).Trim()
+    if ([string]::IsNullOrWhiteSpace($SceneName)) { return @{ success = $false; error = '请指定场景名称' } }
+    $data = Load-MonitorScenes
+    $scene = Get-MonitorSceneByName -Data $data -Name $SceneName
+    if (-not $scene) { return @{ success = $false; error = "未找到场景 '$SceneName'" } }
+
+    $currentMonitors = Get-Monitors
+    if ($currentMonitors.Count -eq 0) { return @{ success = $false; error = '未检测到显示器' } }
+    $originalTopology = Get-DisplayConfigTopology -Flags $QDC_ONLY_ACTIVE_PATHS
+    if (-not $originalTopology.success -or @($originalTopology.paths).Count -eq 0) {
+        return @{ success = $false; error = if ($originalTopology.error) { $originalTopology.error } else { '无法读取当前活动显示拓扑' } }
+    }
+    $allTopology = Get-DisplayConfigTopology -Flags $QDC_ALL_PATHS
+    if (-not $allTopology.success) { return @{ success = $false; error = $allTopology.error } }
+
+    $plan = Get-MonitorSceneTopologyPlan -Scene $scene -CurrentMonitors $currentMonitors -ActiveTopology $originalTopology -AllTopology $allTopology
+    if (-not $plan.success) { return $plan }
+
+    # 在任何写入前保存所有当前活动显示器的模式，场景后续任一步失败都能整体恢复。
+    $displaySnapshots = @()
+    foreach ($monitor in @($currentMonitors | Where-Object { Test-MonitorIsActive $_ })) {
+        $snapshot = Get-CurrentDisplayModeSnapshot -DisplayName ([string]$monitor.DisplayName)
+        if (-not $snapshot.success) {
+            return @{ success = $false; error = "无法读取 '$($monitor.MonitorName)' 的原始显示模式，已取消场景切换: $($snapshot.error)" }
+        }
+        $displaySnapshots += [PSCustomObject]@{ Monitor = $monitor; TargetKey = (Get-MonitorTargetKey $monitor); Mode = $snapshot.mode }
+    }
+
+    $writeAttempted = $false
+    try {
+        $currentKeys = @(@($originalTopology.paths) | ForEach-Object { Get-DisplayPathTargetKey $_ } | Sort-Object)
+        $desiredKeys = @($plan.desiredTargetKeys | Sort-Object)
+        $topologyChanged = (($currentKeys -join '|') -ne ($desiredKeys -join '|'))
+        $change = @{ success = $true; code = 0; method = 'unchanged' }
+        if ($topologyChanged) {
+            $writeAttempted = $true
+            $change = Set-PathOnlyDisplayTopology -Paths $plan.paths
+        if (-not $change.success) {
+            $rollback = Restore-MonitorSceneSnapshot -TopologySnapshot $originalTopology -DisplaySnapshots $displaySnapshots
+            return @{
+                success = $false
+                error = "场景拓扑切换失败 (code=$($change.code))；$($rollback.message)"
+                result = @{ rollbackAttempted = $true; rollbackSuccess = [bool]$rollback.success; rollbackMessage = $rollback.message }
+            }
+        }
+        }
+
+        $verified = Wait-MonitorSceneState -ExpectedTargetKeys $plan.desiredTargetKeys
+        if (-not $verified.success) {
+            $rollback = Restore-MonitorSceneSnapshot -TopologySnapshot $originalTopology -DisplaySnapshots $displaySnapshots
+            return @{
+                success = $false
+                error = "场景拓扑回读与预期不一致；$($rollback.message)"
+                result = @{ rollbackAttempted = $true; rollbackSuccess = [bool]$rollback.success; rollbackMessage = $rollback.message }
+            }
+        }
+
+        $settingsResults = @()
+        $pendingRestart = $false
+        foreach ($mapping in @($plan.mappings | Where-Object { [bool]$_.Entry.isActive })) {
+            $latestTarget = Resolve-MonitorByTargetIdentity -Monitors $verified.monitors -MonitorId ([string]$mapping.Target.MonitorId) -TargetKey ([string]$mapping.TargetKey)
+            if (-not $latestTarget -or -not (Test-MonitorIsActive $latestTarget)) {
+                $rollback = Restore-MonitorSceneSnapshot -TopologySnapshot $originalTopology -DisplaySnapshots $displaySnapshots
+                return @{
+                    success = $false
+                    error = "场景切换后无法定位显示器 '$($mapping.Entry.monitorName)'；$($rollback.message)"
+                    result = @{ rollbackAttempted = $true; rollbackSuccess = [bool]$rollback.success; rollbackMessage = $rollback.message }
+                }
+            }
+
+            $writeAttempted = $true
+            $applyResult = Invoke-ApplyTemplateCoreUnlocked -MonitorSpec ([string]$latestTarget.MonitorId) -TemplateName $SceneName -DirectTemplate $mapping.Entry -DirectTarget $latestTarget -OperationLabel '场景'
+            $settingsResults += $applyResult
+            if (-not $applyResult.success) {
+                $rollback = Restore-MonitorSceneSnapshot -TopologySnapshot $originalTopology -DisplaySnapshots $displaySnapshots
+                return @{
+                    success = $false
+                    error = "应用 '$($mapping.Entry.monitorName)' 的场景参数失败: $($applyResult.error)；$($rollback.message)"
+                    result = @{ settings = $settingsResults; rollbackAttempted = $true; rollbackSuccess = [bool]$rollback.success; rollbackMessage = $rollback.message }
+                }
+            }
+            if ($applyResult.pendingRestart -or -not $applyResult.allSuccess) { $pendingRestart = $true }
+            # 前一台显示器改变模式后重新枚举，供下一台使用最新 GDI/source 映射。
+            $verified.monitors = Get-Monitors
+        }
+
+        return @{
+            success = $true
+            allSuccess = (-not $pendingRestart)
+            pendingRestart = $pendingRestart
+            name = $SceneName
+            activeCount = [int]$plan.activeCount
+            topologyChanged = $topologyChanged
+            method = $change.method
+            settings = $settingsResults
+            message = if ($pendingRestart) { "场景 '$SceneName' 已切换，部分显示模式需要重启后生效" } else { "场景 '$SceneName' 已应用并验证" }
+        }
+    } catch {
+        $unexpectedError = $_.Exception.Message
+        if (-not $writeAttempted) { return @{ success = $false; error = "应用场景失败: $unexpectedError" } }
+        try {
+            $rollback = Restore-MonitorSceneSnapshot -TopologySnapshot $originalTopology -DisplaySnapshots $displaySnapshots
+        } catch {
+            $rollback = @{ success = $false; message = "回滚过程异常: $($_.Exception.Message)" }
+        }
+        return @{
+            success = $false
+            error = "应用场景时发生异常: $unexpectedError；$($rollback.message)"
+            result = @{ rollbackAttempted = $true; rollbackSuccess = [bool]$rollback.success; rollbackMessage = $rollback.message }
+        }
+    }
+}
+
+function Apply-MonitorSceneCore {
+    param([string]$SceneName)
+    try {
+        return Invoke-WithNamedMutex -Name $DisplayMutexName -TimeoutMs 30000 -Action {
+            Invoke-ApplyMonitorSceneCoreUnlocked -SceneName $SceneName
+        }
+    } catch {
+        return @{ success = $false; error = "应用场景失败: $($_.Exception.Message)" }
+    }
+}
+
+function Delete-MonitorSceneCore {
+    param([string]$SceneName)
+    $SceneName = ([string]$SceneName).Trim()
+    if ([string]::IsNullOrWhiteSpace($SceneName)) { return @{ success = $false; error = '请指定场景名称' } }
+    try {
+        return Invoke-WithNamedMutex -Name $DataMutexName -Action {
+            $data = Load-MonitorScenes -ForWrite
+            $before = @($data.scenes).Count
+            $data.scenes = @($data.scenes | Where-Object { [string]$_.name -ne $SceneName })
+            if (@($data.scenes).Count -eq $before) { return @{ success = $false; error = "未找到场景 '$SceneName'" } }
+            if (-not (Save-MonitorScenes $data)) { return @{ success = $false; error = "删除结果未能写入 $SceneFile" } }
+            return @{ success = $true; name = $SceneName }
+        }
+    } catch {
+        return @{ success = $false; error = "删除场景失败: $($_.Exception.Message)" }
     }
 }
 
@@ -2334,6 +2904,82 @@ function Set-MonitorPower {
     Write-Host "POWER_OK: $($result.monitorName) $Operation"
 }
 
+function Save-MonitorScene {
+    param([string]$SceneName)
+    if ([string]::IsNullOrWhiteSpace($SceneName)) {
+        Write-Host '错误: 用法 scene-save <场景名>' -ForegroundColor Red
+        $script:CommandExitCode = 2
+        return
+    }
+    $result = Save-MonitorSceneCore -SceneName $SceneName
+    if (-not $result.success) {
+        Write-Host "错误: $($result.error)" -ForegroundColor Red
+        $script:CommandExitCode = if ($result.duplicate) { 2 } else { 1 }
+        return
+    }
+    Write-Host "场景 '$($result.name)' 已保存：$($result.monitorCount) 台显示器，$($result.activeCount) 台启用" -ForegroundColor Green
+}
+
+function Show-MonitorScenes {
+    $data = Load-MonitorScenes
+    Write-Host ''
+    Write-Host '=== 多显示器场景 ===' -ForegroundColor Cyan
+    Write-Host ''
+    $scenes = @($data.scenes)
+    if ($scenes.Count -eq 0) {
+        Write-Host '  (无场景)' -ForegroundColor Gray
+        return
+    }
+    foreach ($scene in $scenes) {
+        $enabled = @($scene.monitors | Where-Object { [bool]$_.isActive })
+        $disabled = @($scene.monitors | Where-Object { -not [bool]$_.isActive })
+        Write-Host "- $($scene.name)  ($($scene.created))" -ForegroundColor Yellow
+        Write-Host "    开: $(if ($enabled.Count -gt 0) { ($enabled | ForEach-Object { $_.monitorName }) -join '、' } else { '无' })"
+        Write-Host "    关: $(if ($disabled.Count -gt 0) { ($disabled | ForEach-Object { $_.monitorName }) -join '、' } else { '无' })"
+        Write-Host ''
+    }
+}
+
+function Apply-MonitorScene {
+    param([string]$SceneName)
+    if ([string]::IsNullOrWhiteSpace($SceneName)) {
+        Write-Host '错误: 用法 scene-apply <场景名>' -ForegroundColor Red
+        $script:CommandExitCode = 2
+        return
+    }
+    Write-Host "正在应用场景 '$SceneName'..." -ForegroundColor Cyan
+    $result = Apply-MonitorSceneCore -SceneName $SceneName
+    if (-not $result.success) {
+        if ($result.result -and $result.result.rollbackAttempted) {
+            $rollbackText = if ($result.result.rollbackSuccess) { '已恢复应用前的显示配置' } else { "自动恢复失败: $($result.result.rollbackMessage)" }
+            Write-Host $rollbackText -ForegroundColor $(if ($result.result.rollbackSuccess) { 'Yellow' } else { 'Red' })
+        }
+        Write-Host "错误: $($result.error)" -ForegroundColor Red
+        $script:CommandExitCode = 1
+        return
+    }
+    Write-Host "当前活动显示器: $($result.activeCount) 台" -ForegroundColor Gray
+    # 结果摘要保持为最后一行，后台 worker 会将其写入结构化 MM_RESULT 标记。
+    Write-Host $result.message -ForegroundColor $(if ($result.allSuccess) { 'Green' } else { 'Yellow' })
+    if (-not $result.allSuccess) { $script:CommandExitCode = 2 }
+}
+
+function Remove-MonitorScene {
+    param([string]$SceneName)
+    if ([string]::IsNullOrWhiteSpace($SceneName)) {
+        Write-Host '错误: 用法 scene-delete <场景名>' -ForegroundColor Red
+        $script:CommandExitCode = 2
+        return
+    }
+    $result = Delete-MonitorSceneCore -SceneName $SceneName
+    if (-not $result.success) {
+        Write-Host "错误: $($result.error)" -ForegroundColor Red
+        $script:CommandExitCode = 1
+        return
+    }
+    Write-Host "场景 '$($result.name)' 已删除" -ForegroundColor Green
+}
+
 function Show-Templates {
     param([string]$MonitorSpec)
     $templates = Load-Templates
@@ -2484,6 +3130,458 @@ function Show-Menu {
         } else {
             Write-Host "无效选择" -ForegroundColor Red
         }
+    }
+}
+
+# ============================================================
+#  多显示器场景 GUI
+# ============================================================
+
+function Read-MonitorSceneName {
+    param($Owner, [string]$InitialValue = '')
+
+    $ownerDpi = 96
+    if ($Owner -and $null -ne $Owner.PSObject.Properties['DeviceDpi'] -and [int]$Owner.DeviceDpi -gt 0) { $ownerDpi = [int]$Owner.DeviceDpi }
+    $dialogScale = [Math]::Max(1.0, [Math]::Min(2.0, ([double]$ownerDpi / 96.0)))
+    $scalePx = { param([int]$Value) return [int][Math]::Round($Value * $dialogScale) }.GetNewClosure()
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = '保存多显示器场景'
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.ShowInTaskbar = $false
+    $dialog.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $dialog.ClientSize = New-Object System.Drawing.Size((& $scalePx 430), (& $scalePx 165))
+    $dialogFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $dialog.Font = $dialogFont
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = '为当前显示器配置命名'
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point((& $scalePx 20), (& $scalePx 18))
+    $dialog.Controls.Add($label)
+
+    $textBox = New-Object System.Windows.Forms.TextBox
+    $textBox.Text = $InitialValue
+    $textBox.MaxLength = 100
+    $textBox.Location = New-Object System.Drawing.Point((& $scalePx 20), (& $scalePx 48))
+    $textBox.Size = New-Object System.Drawing.Size((& $scalePx 390), (& $scalePx 28))
+    $dialog.Controls.Add($textBox)
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = '保存'
+    $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $okButton.Location = New-Object System.Drawing.Point((& $scalePx 230), (& $scalePx 108))
+    $okButton.Size = New-Object System.Drawing.Size((& $scalePx 85), (& $scalePx 34))
+    $dialog.Controls.Add($okButton)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = '取消'
+    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $cancelButton.Location = New-Object System.Drawing.Point((& $scalePx 325), (& $scalePx 108))
+    $cancelButton.Size = New-Object System.Drawing.Size((& $scalePx 85), (& $scalePx 34))
+    $dialog.Controls.Add($cancelButton)
+
+    $dialog.AcceptButton = $okButton
+    $dialog.CancelButton = $cancelButton
+    $dialog.Add_Shown({ $textBox.Focus(); $textBox.SelectAll() })
+    try {
+        $accepted = $dialog.ShowDialog($Owner) -eq [System.Windows.Forms.DialogResult]::OK
+        return [PSCustomObject]@{ Accepted = $accepted; Text = ([string]$textBox.Text).Trim() }
+    } finally {
+        $dialog.Dispose()
+        try { $dialogFont.Dispose() } catch {}
+    }
+}
+
+function Show-MonitorSceneManagerDialog {
+    param($Owner, [string]$ScriptPath)
+
+    $ownerDpi = 96
+    if ($Owner -and $null -ne $Owner.PSObject.Properties['DeviceDpi'] -and [int]$Owner.DeviceDpi -gt 0) { $ownerDpi = [int]$Owner.DeviceDpi }
+    $dialogScale = [Math]::Max(1.0, [Math]::Min(2.0, ([double]$ownerDpi / 96.0)))
+    $scalePx = { param([int]$Value) return [int][Math]::Round($Value * $dialogScale) }.GetNewClosure()
+    try { $workingArea = [System.Windows.Forms.Screen]::FromControl($Owner).WorkingArea } catch { $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea }
+    $ownerWidth = if ($Owner -and $Owner.Width -gt 0) { [int]$Owner.Width } else { [int]$workingArea.Width }
+    $ownerHeight = if ($Owner -and $Owner.Height -gt 0) { [int]$Owner.Height } else { [int]$workingArea.Height }
+    $maxDialogWidth = [int][Math]::Min($workingArea.Width * 0.86, $ownerWidth * 0.90)
+    $maxDialogHeight = [int][Math]::Min($workingArea.Height * 0.86, $ownerHeight * 0.90)
+    $dialogWidth = [int][Math]::Max((& $scalePx 680), [Math]::Min((& $scalePx 760), $maxDialogWidth))
+    $dialogHeight = [int][Math]::Max((& $scalePx 460), [Math]::Min((& $scalePx 520), $maxDialogHeight))
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = '多显示器场景'
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'Sizable'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.ShowInTaskbar = $false
+    $dialog.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $dialog.ClientSize = New-Object System.Drawing.Size($dialogWidth, $dialogHeight)
+    $dialog.MinimumSize = New-Object System.Drawing.Size((& $scalePx 680), (& $scalePx 460))
+    $dialog.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
+
+    $titleFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 15, [System.Drawing.FontStyle]::Bold)
+    $bodyFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $listFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+    $detailFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+    $buttonFont = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $dialog.Font = $bodyFont
+    $dialogFonts = @($titleFont, $bodyFont, $listFont, $detailFont, $buttonFont)
+
+    $rootLayout = New-Object System.Windows.Forms.TableLayoutPanel
+    $rootLayout.Dock = 'Fill'
+    $rootLayout.RowCount = 3
+    $rootLayout.ColumnCount = 1
+    $rootLayout.Padding = New-Object System.Windows.Forms.Padding((& $scalePx 24))
+    $rootLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, (& $scalePx 72))))
+    $rootLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    $rootLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, (& $scalePx 52))))
+    $dialog.Controls.Add($rootLayout)
+
+    $headerLayout = New-Object System.Windows.Forms.TableLayoutPanel
+    $headerLayout.Dock = 'Fill'
+    $headerLayout.RowCount = 2
+    $headerLayout.ColumnCount = 1
+    $headerLayout.Margin = New-Object System.Windows.Forms.Padding(0)
+    $headerLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, (& $scalePx 38))))
+    $headerLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    $rootLayout.Controls.Add($headerLayout, 0, 0)
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = '多显示器场景'
+    $title.Font = $titleFont
+    $title.Dock = 'Fill'
+    $title.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $title.Margin = New-Object System.Windows.Forms.Padding(0)
+    $headerLayout.Controls.Add($title, 0, 0)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '保存当前多屏的开关状态和显示参数，之后可一键恢复。'
+    $hint.ForeColor = [System.Drawing.Color]::FromArgb(100, 116, 139)
+    $hint.Dock = 'Fill'
+    $hint.TextAlign = [System.Drawing.ContentAlignment]::TopLeft
+    $hint.AutoEllipsis = $true
+    $hint.Margin = New-Object System.Windows.Forms.Padding(0)
+    $headerLayout.Controls.Add($hint, 0, 1)
+
+    $contentLayout = New-Object System.Windows.Forms.TableLayoutPanel
+    $contentLayout.Dock = 'Fill'
+    $contentLayout.RowCount = 1
+    $contentLayout.ColumnCount = 2
+    $contentLayout.Margin = New-Object System.Windows.Forms.Padding(0)
+    $contentLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 34)))
+    $contentLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 66)))
+    $rootLayout.Controls.Add($contentLayout, 0, 1)
+
+    $sceneList = New-Object System.Windows.Forms.ListBox
+    $sceneList.Dock = 'Fill'
+    $sceneList.Font = $listFont
+    $sceneList.IntegralHeight = $false
+    $sceneList.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $sceneList.Margin = New-Object System.Windows.Forms.Padding(0, 0, (& $scalePx 18), 0)
+    $contentLayout.Controls.Add($sceneList, 0, 0)
+
+    $detailLayout = New-Object System.Windows.Forms.TableLayoutPanel
+    $detailLayout.Dock = 'Fill'
+    $detailLayout.RowCount = 2
+    $detailLayout.ColumnCount = 1
+    $detailLayout.Margin = New-Object System.Windows.Forms.Padding(0)
+    $detailLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    $detailLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, (& $scalePx 58))))
+    $contentLayout.Controls.Add($detailLayout, 1, 0)
+
+    $details = New-Object System.Windows.Forms.Label
+    $details.Dock = 'Fill'
+    $details.Font = $detailFont
+    $details.ForeColor = [System.Drawing.Color]::FromArgb(51, 65, 85)
+    $details.BackColor = [System.Drawing.Color]::White
+    $details.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $details.Padding = New-Object System.Windows.Forms.Padding((& $scalePx 18), (& $scalePx 14), (& $scalePx 18), (& $scalePx 14))
+    $details.Margin = New-Object System.Windows.Forms.Padding(0)
+    $details.AutoEllipsis = $true
+    $detailLayout.Controls.Add($details, 0, 0)
+
+    $status = New-Object System.Windows.Forms.Label
+    $status.Dock = 'Fill'
+    $status.ForeColor = [System.Drawing.Color]::FromArgb(100, 116, 139)
+    $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $status.AutoEllipsis = $true
+    $status.Margin = New-Object System.Windows.Forms.Padding(0, (& $scalePx 6), 0, 0)
+    $detailLayout.Controls.Add($status, 0, 1)
+
+    $buttonBar = New-Object System.Windows.Forms.Panel
+    $buttonBar.Dock = 'Fill'
+    $buttonBar.Margin = New-Object System.Windows.Forms.Padding(0, (& $scalePx 10), 0, 0)
+    $rootLayout.Controls.Add($buttonBar, 0, 2)
+
+    $saveButton = New-Object System.Windows.Forms.Button
+    $saveButton.Text = '保存当前配置'
+    $saveButton.Font = $buttonFont
+    $saveButton.Dock = 'Left'
+    $saveButton.Size = New-Object System.Drawing.Size((& $scalePx 130), (& $scalePx 38))
+    $saveButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $saveButton.FlatAppearance.BorderSize = 0
+    $saveButton.BackColor = [System.Drawing.Color]::FromArgb(59, 130, 246)
+    $saveButton.ForeColor = [System.Drawing.Color]::White
+    $buttonBar.Controls.Add($saveButton)
+
+    $actionFlow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $actionFlow.Dock = 'Right'
+    $actionFlow.Width = & $scalePx 330
+    $actionFlow.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $actionFlow.WrapContents = $false
+    $actionFlow.Margin = New-Object System.Windows.Forms.Padding(0)
+    $buttonBar.Controls.Add($actionFlow)
+
+    $applyButton = New-Object System.Windows.Forms.Button
+    $applyButton.Text = '应用场景'
+    $applyButton.Font = $buttonFont
+    $applyButton.Size = New-Object System.Drawing.Size((& $scalePx 96), (& $scalePx 38))
+    $applyButton.Margin = New-Object System.Windows.Forms.Padding((& $scalePx 10), 0, 0, 0)
+    $applyButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $applyButton.FlatAppearance.BorderSize = 0
+    $applyButton.BackColor = [System.Drawing.Color]::FromArgb(22, 163, 74)
+    $applyButton.ForeColor = [System.Drawing.Color]::White
+    $applyButton.Enabled = $false
+
+    $deleteButton = New-Object System.Windows.Forms.Button
+    $deleteButton.Text = '删除'
+    $deleteButton.Font = $buttonFont
+    $deleteButton.Size = New-Object System.Drawing.Size((& $scalePx 88), (& $scalePx 38))
+    $deleteButton.Margin = New-Object System.Windows.Forms.Padding((& $scalePx 10), 0, 0, 0)
+    $deleteButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $deleteButton.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(254, 202, 202)
+    $deleteButton.BackColor = [System.Drawing.Color]::FromArgb(254, 242, 242)
+    $deleteButton.ForeColor = [System.Drawing.Color]::FromArgb(220, 38, 38)
+    $deleteButton.Enabled = $false
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = '关闭'
+    $closeButton.Font = $buttonFont
+    $closeButton.Size = New-Object System.Drawing.Size((& $scalePx 88), (& $scalePx 38))
+    $closeButton.Margin = New-Object System.Windows.Forms.Padding((& $scalePx 10), 0, 0, 0)
+    $closeButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $closeButton.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(226, 232, 240)
+    $closeButton.BackColor = [System.Drawing.Color]::White
+    $closeButton.ForeColor = [System.Drawing.Color]::FromArgb(71, 85, 105)
+
+    # RightToLeft 顺序：关闭在最右，删除居中，应用场景在左。
+    $actionFlow.Controls.Add($closeButton)
+    $actionFlow.Controls.Add($deleteButton)
+    $actionFlow.Controls.Add($applyButton)
+
+    $state = @{ Scenes = @(); InProgress = $false; Process = $null; Timer = $null; Applied = $false }
+    $setBusy = {
+        param([bool]$Busy)
+        $state.InProgress = $Busy
+        $sceneList.Enabled = -not $Busy
+        $saveButton.Enabled = -not $Busy
+        $applyButton.Enabled = (-not $Busy -and $sceneList.SelectedIndex -ge 0)
+        $deleteButton.Enabled = (-not $Busy -and $sceneList.SelectedIndex -ge 0)
+        $closeButton.Enabled = $true
+        $dialog.UseWaitCursor = $Busy
+    }.GetNewClosure()
+
+    $refreshScenes = {
+        $selectedName = if ($sceneList.SelectedIndex -ge 0) { [string]$sceneList.SelectedItem } else { '' }
+        $data = Load-MonitorScenes
+        $state.Scenes = @($data.scenes)
+        $sceneList.BeginUpdate()
+        try {
+            $sceneList.Items.Clear()
+            foreach ($scene in $state.Scenes) { [void]$sceneList.Items.Add([string]$scene.name) }
+            if ($selectedName -and $sceneList.Items.Contains($selectedName)) {
+                $sceneList.SelectedItem = $selectedName
+            } elseif ($sceneList.Items.Count -gt 0) {
+                $sceneList.SelectedIndex = 0
+            }
+        } finally {
+            $sceneList.EndUpdate()
+        }
+        if ($sceneList.Items.Count -eq 0) {
+            $details.Text = "暂无已保存的场景`n`n点击左下角的'保存当前配置'，记录当前所有显示器的开关状态和显示参数。"
+            $applyButton.Enabled = $false
+            $deleteButton.Enabled = $false
+        }
+    }.GetNewClosure()
+
+    $sceneList.Add_SelectedIndexChanged({
+        $index = $sceneList.SelectedIndex
+        if ($index -lt 0 -or $index -ge $state.Scenes.Count) {
+            $details.Text = ''
+            $applyButton.Enabled = $false
+            $deleteButton.Enabled = $false
+            return
+        }
+        $scene = $state.Scenes[$index]
+        $lines = @(
+            "场景名称  $($scene.name)",
+            "保存时间  $($scene.created)",
+            '',
+            '显示器配置'
+        )
+        $number = 1
+        foreach ($monitor in @($scene.monitors)) {
+            if ([bool]$monitor.isActive) {
+                $dpiText = if ([int]$monitor.dpiScale -gt 0) { "$($monitor.dpiScale)%" } else { '未知' }
+                $lines += "$number. $($monitor.monitorName)  ·  已开启"
+                $lines += "   $($monitor.width) × $($monitor.height)  ·  $($monitor.refreshRate) Hz  ·  $($monitor.bitsPerPel) bit  ·  缩放 $dpiText"
+            } else {
+                $lines += "$number. $($monitor.monitorName)  ·  已关闭"
+            }
+            $lines += ''
+            $number++
+        }
+        $details.Text = ($lines -join "`n").TrimEnd()
+        $applyButton.Enabled = -not $state.InProgress
+        $deleteButton.Enabled = -not $state.InProgress
+    }.GetNewClosure())
+
+    $saveButton.Add_Click({
+        $inputResult = Read-MonitorSceneName -Owner $dialog
+        if (-not $inputResult.Accepted) { return }
+        if ([string]::IsNullOrWhiteSpace($inputResult.Text)) {
+            [void][System.Windows.Forms.MessageBox]::Show($dialog, '请输入场景名称', '提示', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            return
+        }
+        $existing = Get-MonitorSceneByName -Data (Load-MonitorScenes) -Name $inputResult.Text
+        if ($existing) {
+            $confirm = [System.Windows.Forms.MessageBox]::Show($dialog, "场景 '$($inputResult.Text)' 已存在，是否用当前配置覆盖？", '确认覆盖', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+            if ($confirm -ne 'Yes') { return }
+        }
+        $result = Save-MonitorSceneCore -SceneName $inputResult.Text
+        if ($result.success) {
+            $status.Text = "场景 '$($result.name)' 已保存"
+            $status.ForeColor = [System.Drawing.Color]::FromArgb(22, 163, 74)
+            & $refreshScenes
+            $sceneList.SelectedItem = [string]$result.name
+        } else {
+            $status.Text = $result.error
+            $status.ForeColor = [System.Drawing.Color]::FromArgb(220, 38, 38)
+        }
+    }.GetNewClosure())
+
+    $deleteButton.Add_Click({
+        if ($sceneList.SelectedIndex -lt 0) { return }
+        $name = [string]$sceneList.SelectedItem
+        $confirm = [System.Windows.Forms.MessageBox]::Show($dialog, "确认删除场景 '$name'？", '确认删除', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($confirm -ne 'Yes') { return }
+        $result = Delete-MonitorSceneCore -SceneName $name
+        if ($result.success) {
+            $status.Text = "场景 '$name' 已删除"
+            $status.ForeColor = [System.Drawing.Color]::FromArgb(22, 163, 74)
+            & $refreshScenes
+        } else {
+            $status.Text = $result.error
+            $status.ForeColor = [System.Drawing.Color]::FromArgb(220, 38, 38)
+        }
+    }.GetNewClosure())
+
+    $applyButton.Add_Click({
+        if ($state.InProgress -or $sceneList.SelectedIndex -lt 0) { return }
+        $name = [string]$sceneList.SelectedItem
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            $dialog,
+            "确认切换到场景 '$name'？`n`n显示器连接状态、分辨率、刷新率和缩放比例将立即变化。",
+            '确认切换场景', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($confirm -ne 'Yes') { return }
+
+        try {
+            if ([string]::IsNullOrWhiteSpace($ScriptPath) -or -not (Test-Path -LiteralPath $ScriptPath)) { throw '无法获取当前脚本路径' }
+            & $setBusy $true
+            $status.Text = "正在切换场景 '$name'，请稍候..."
+            $status.ForeColor = [System.Drawing.Color]::FromArgb(71, 85, 105)
+
+            $encodedName = ConvertTo-Base64Text $name
+            $hostPath = Get-PreferredPowerShellHostPath
+            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $processInfo.FileName = $hostPath
+            $processInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`" scene-worker $encodedName"
+            $processInfo.UseShellExecute = $false
+            $processInfo.CreateNoWindow = $true
+            $processInfo.RedirectStandardOutput = $true
+            $processInfo.RedirectStandardError = $true
+
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $processInfo
+            if (-not $process.Start()) { throw '无法启动后台场景切换进程' }
+            $state.Process = $process
+
+            $timer = New-Object System.Windows.Forms.Timer
+            $timer.Interval = 180
+            $state.Timer = $timer
+            $processForScene = $process
+            $timerForScene = $timer
+            $dialogForScene = $dialog
+            $statusForScene = $status
+            $stateForScene = $state
+            $setBusyForScene = $setBusy
+            $refreshForScene = $refreshScenes
+            $nameForScene = $name
+            $timer.Add_Tick({
+                if (-not $processForScene.HasExited) { return }
+                try {
+                    $timerForScene.Stop()
+                    $processForScene.WaitForExit()
+                    $stdout = $processForScene.StandardOutput.ReadToEnd()
+                    $stderr = $processForScene.StandardError.ReadToEnd()
+                    $exitCode = $processForScene.ExitCode
+                    $processForScene.Dispose()
+                    $timerForScene.Dispose()
+                    $stateForScene.Process = $null
+                    $stateForScene.Timer = $null
+                    if (-not $dialogForScene -or $dialogForScene.IsDisposed) { return }
+                    & $setBusyForScene $false
+                    & $refreshForScene
+                    if ($exitCode -eq 0) {
+                        $stateForScene.Applied = $true
+                        $statusForScene.Text = "场景 '$nameForScene' 已切换并验证"
+                        $statusForScene.ForeColor = [System.Drawing.Color]::FromArgb(22, 163, 74)
+                    } else {
+                        $detail = Get-WorkerResultMessage -StandardOutput $stdout -StandardError $stderr -Fallback '场景切换失败'
+                        if ($exitCode -eq 2) { $stateForScene.Applied = $true }
+                        $statusForScene.Text = $detail
+                        $statusForScene.ForeColor = if ($exitCode -eq 2) { [System.Drawing.Color]::FromArgb(180, 83, 9) } else { [System.Drawing.Color]::FromArgb(220, 38, 38) }
+                    }
+                } catch {
+                    try { $timerForScene.Stop(); $timerForScene.Dispose() } catch {}
+                    try { $processForScene.Dispose() } catch {}
+                    $stateForScene.Process = $null
+                    $stateForScene.Timer = $null
+                    if ($dialogForScene -and -not $dialogForScene.IsDisposed) {
+                        & $setBusyForScene $false
+                        $statusForScene.Text = "处理场景切换结果失败: $($_.Exception.Message)"
+                        $statusForScene.ForeColor = [System.Drawing.Color]::FromArgb(220, 38, 38)
+                    }
+                }
+            }.GetNewClosure())
+            $timer.Start()
+        } catch {
+            if ($state.Timer) { try { $state.Timer.Dispose() } catch {}; $state.Timer = $null }
+            if ($state.Process) { try { $state.Process.Dispose() } catch {}; $state.Process = $null }
+            & $setBusy $false
+            $status.Text = "启动场景切换失败: $($_.Exception.Message)"
+            $status.ForeColor = [System.Drawing.Color]::FromArgb(220, 38, 38)
+        }
+    }.GetNewClosure())
+
+    $closeButton.Add_Click({ $dialog.Close() }.GetNewClosure())
+    $dialog.Add_FormClosed({
+        if ($state.Timer) { try { $state.Timer.Stop(); $state.Timer.Dispose() } catch {}; $state.Timer = $null }
+        if ($state.Process) { try { $state.Process.Dispose() } catch {}; $state.Process = $null }
+    }.GetNewClosure())
+
+    & $refreshScenes
+    try {
+        [void]$dialog.ShowDialog($Owner)
+        return [bool]$state.Applied
+    } finally {
+        $dialog.Dispose()
+        foreach ($font in $dialogFonts) { try { $font.Dispose() } catch {} }
     }
 }
 
@@ -2726,7 +3824,7 @@ function Show-Gui {
     $sidebar.Controls.Add($sidebarBottom)
 
     $verLabel = New-Object System.Windows.Forms.Label
-    $verLabel.Text = 'v1.0.0'
+    $verLabel.Text = 'v1.1.0'
     $verLabel.Font = $fontTiny
     $verLabel.ForeColor = [System.Drawing.Color]::FromArgb(71, 85, 105)
     $verLabel.AutoSize = $true
@@ -2768,7 +3866,7 @@ function Show-Gui {
     # 右侧按钮 FlowLayoutPanel
     $btnFlow = New-Object System.Windows.Forms.FlowLayoutPanel
     $btnFlow.Dock = 'Right'
-    $btnFlow.Width = [int](340 * $dpiScale)
+    $btnFlow.Width = [int](460 * $dpiScale)
     $btnFlow.FlowDirection = 'RightToLeft'
     $btnFlow.WrapContents = $false
     $btnFlow.BackColor = $cBg
@@ -2823,6 +3921,21 @@ function Show-Gui {
     $applyBtn.Margin = New-Object System.Windows.Forms.Padding(0)
     $applyBtn.Add_HandleCreated({ Set-RoundedRegion -Control $this -Radius ([int](7 * $dpiScale)) })
     $btnFlow.Controls.Add($applyBtn)
+
+    # 多显示器场景入口
+    $sceneBtn = New-Object System.Windows.Forms.Button
+    $sceneBtn.Text = '多屏场景'
+    $sceneBtn.Font = $fontBase
+    $sceneBtn.FlatStyle = 'Flat'
+    $sceneBtn.BackColor = $cAccent
+    $sceneBtn.ForeColor = $cTextInv
+    $sceneBtn.Cursor = 'Hand'
+    $sceneBtn.FlatAppearance.BorderSize = 0
+    $sceneBtn.FlatAppearance.MouseOverBackColor = $cAccentDk
+    $sceneBtn.Size = New-Object System.Drawing.Size([int](100 * $dpiScale), $btnH)
+    $sceneBtn.Margin = New-Object System.Windows.Forms.Padding(0, 0, [int](10 * $dpiScale), 0)
+    $sceneBtn.Add_HandleCreated({ Set-RoundedRegion -Control $this -Radius ([int](7 * $dpiScale)) })
+    $btnFlow.Controls.Add($sceneBtn)
 
     # 左侧标题区：面包屑 + 主标题
     $titlePanel = New-Object System.Windows.Forms.Panel
@@ -4084,9 +5197,7 @@ function Show-Gui {
 
         try {
             $encodedMonitor = ConvertTo-Base64Text ([string]$targetMonitor.MonitorId)
-            $powershellCommand = Get-Command 'powershell.exe' -ErrorAction SilentlyContinue
-            $hostPath = if ($powershellCommand) { $powershellCommand.Source } else { (Get-Process -Id $PID).Path }
-            if (-not $hostPath -or -not (Test-Path $hostPath)) { $hostPath = 'powershell.exe' }
+            $hostPath = Get-PreferredPowerShellHostPath
             if ([string]::IsNullOrWhiteSpace($guiScriptPath) -or -not (Test-Path -LiteralPath $guiScriptPath)) { throw '无法获取当前脚本路径' }
 
             $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -4185,6 +5296,21 @@ function Show-Gui {
     }.GetNewClosure()
 
     # ===== 事件绑定 =====
+    $sceneBtn.Add_Click({
+        if ($applyUiState.InProgress -or $powerUiState.InProgress) {
+            & $showStatus '另一项显示操作正在进行，请稍候' ''
+            return
+        }
+        try {
+            $sceneApplied = Show-MonitorSceneManagerDialog -Owner $form -ScriptPath $guiScriptPath
+            & $refreshMonitors
+            & $refreshTemplates
+            if ($sceneApplied) { & $showStatus '多显示器场景已切换' 'success' }
+        } catch {
+            & $showStatus "打开多显示器场景失败: $($_.Exception.Message)" 'error'
+        }
+    }.GetNewClosure())
+
     $applyBtn.Add_Click({
         if (-not $script:selectedTemplate) { return }
         if (-not $script:selectedMonitor) {
@@ -4221,9 +5347,7 @@ function Show-Gui {
             # 在独立的 PowerShell 子进程中应用；WinForms 线程只用定时器轮询，不会卡住窗口。
             $encodedMonitor = ConvertTo-Base64Text $monitorSpec
             $encodedName = ConvertTo-Base64Text $name
-            $powershellCommand = Get-Command 'powershell.exe' -ErrorAction SilentlyContinue
-            $hostPath = if ($powershellCommand) { $powershellCommand.Source } else { (Get-Process -Id $PID).Path }
-            if (-not $hostPath -or -not (Test-Path $hostPath)) { $hostPath = 'powershell.exe' }
+            $hostPath = Get-PreferredPowerShellHostPath
             if ([string]::IsNullOrWhiteSpace($guiScriptPath) -or -not (Test-Path -LiteralPath $guiScriptPath)) { throw '无法获取当前脚本路径' }
 
             $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -4630,14 +5754,16 @@ public class Shell32Api {
     $desktop = [Environment]::GetFolderPath('Desktop')
     $shortcutPath = Join-Path $desktop '显示器配置管理.lnk'
     $tempShortcutPath = Join-Path $desktop (".显示器配置管理.{0}.tmp.lnk" -f [Guid]::NewGuid().ToString('N'))
+    $backupShortcutPath = Join-Path $desktop (".显示器配置管理.{0}.backup.lnk" -f [Guid]::NewGuid().ToString('N'))
     $wsh = $null
     $sc = $null
+    $hostPath = Get-PreferredPowerShellHostPath
 
     try {
         $wsh = New-Object -ComObject WScript.Shell
         # 先完整生成并验证临时快捷方式，再原子替换；失败时保留原有快捷方式。
         $sc = $wsh.CreateShortcut($tempShortcutPath)
-        $sc.TargetPath = 'powershell.exe'
+        $sc.TargetPath = $hostPath
         $sc.Arguments = "-WindowStyle Minimized -ExecutionPolicy Bypass -File `"$scriptPath`" gui"
         $sc.WorkingDirectory = Split-Path $scriptPath
         $sc.IconLocation = "$iconPath, 0"
@@ -4647,12 +5773,18 @@ public class Shell32Api {
         if (-not (Test-Path $tempShortcutPath)) { throw '临时快捷方式文件未创建' }
 
         if (Test-Path $shortcutPath) {
-            [System.IO.File]::Replace($tempShortcutPath, $shortcutPath, $null, $true)
+            # File.Replace 在部分 .NET/Windows 组合中不接受空备份路径；使用唯一真实备份，
+            # 成功后删除，失败时仍保留原快捷方式或备份副本。
+            [System.IO.File]::Replace($tempShortcutPath, $shortcutPath, $backupShortcutPath, $true)
+            Remove-Item -LiteralPath $backupShortcutPath -Force -ErrorAction SilentlyContinue
         } else {
             [System.IO.File]::Move($tempShortcutPath, $shortcutPath)
         }
     } catch {
         if (Test-Path $tempShortcutPath) { Remove-Item $tempShortcutPath -Force -ErrorAction SilentlyContinue }
+        if (-not (Test-Path $shortcutPath) -and (Test-Path $backupShortcutPath)) {
+            try { [System.IO.File]::Move($backupShortcutPath, $shortcutPath) } catch {}
+        }
         Write-Host "错误: 创建快捷方式失败 - $($_.Exception.Message)" -ForegroundColor Red
         $script:CommandExitCode = 1
         return
@@ -4662,6 +5794,9 @@ public class Shell32Api {
         }
         if ($wsh -and [System.Runtime.InteropServices.Marshal]::IsComObject($wsh)) {
             [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wsh)
+        }
+        if ((Test-Path -LiteralPath $shortcutPath) -and (Test-Path -LiteralPath $backupShortcutPath)) {
+            Remove-Item -LiteralPath $backupShortcutPath -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -4680,6 +5815,7 @@ public class Shell32Api {
     Write-Host "桌面快捷方式已创建（自定义图标）:" -ForegroundColor Green
     Write-Host "  路径: $shortcutPath" -ForegroundColor Gray
     Write-Host "  图标: $iconPath" -ForegroundColor Gray
+    Write-Host "  运行时: $hostPath" -ForegroundColor Gray
     Write-Host "  大小: $($fileInfo.Length) 字节" -ForegroundColor Gray
     Write-Host ""
     Write-Host "双击快捷方式将打开图形界面程序" -ForegroundColor Cyan
@@ -4782,7 +5918,7 @@ function Set-DpiInteractive {
 function Show-Help {
     Write-Host ""
     Write-Host "=== 显示器配置管理工具 ===" -ForegroundColor Cyan
-    Write-Host "  （按单个显示器保存和应用模板）"
+    Write-Host "  （单显示器参数模板 + 多显示器场景切换）"
     Write-Host ""
     Write-Host "图形界面:" -ForegroundColor Yellow
     Write-Host "  .\MonitorManager.ps1                 打开 GUI 程序（默认）"
@@ -4795,6 +5931,10 @@ function Show-Help {
     Write-Host "  .\MonitorManager.ps1 apply <序号> <名称>         应用模板到指定显示器"
     Write-Host "  .\MonitorManager.ps1 disconnect <序号>          从 Windows 桌面断开指定显示器"
     Write-Host "  .\MonitorManager.ps1 connect <序号>             将指定显示器重新连接到 Windows 桌面"
+    Write-Host "  .\MonitorManager.ps1 scene-save <名称>          保存当前全部显示器为场景"
+    Write-Host "  .\MonitorManager.ps1 scene-apply <名称>         一键切换多显示器场景"
+    Write-Host "  .\MonitorManager.ps1 scenes                     列出多显示器场景"
+    Write-Host "  .\MonitorManager.ps1 scene-delete <名称>        删除多显示器场景"
     Write-Host "  .\MonitorManager.ps1 templates [序号]           列出模板（可选指定显示器）"
     Write-Host "  .\MonitorManager.ps1 show <序号> <名称>          查看模板详情"
     Write-Host "  .\MonitorManager.ps1 delete <序号> <名称>        删除指定显示器的模板"
@@ -4806,6 +5946,8 @@ function Show-Help {
     Write-Host "  <序号> 可以是 list/templates 显示的序号，也可以是显示器 ID、设备名或唯一友好名称"
     Write-Host "  已断开显示器的模板仍会在 templates 中显示，并可通过 show/delete 管理"
     Write-Host "  每个显示器的模板独立保存，互不影响"
+    Write-Host "  场景保存全部已检测显示器的开/关状态，以及活动显示器的分辨率、刷新率、色深和缩放"
+    Write-Host "  应用旧场景时，场景保存后新增的活动显示器会保持当前状态"
     Write-Host "  为避免桌面完全不可用，工具不会断开最后一台活动显示器"
     Write-Host ""
     Write-Host "示例:" -ForegroundColor Yellow
@@ -4815,6 +5957,8 @@ function Show-Help {
     Write-Host "  .\MonitorManager.ps1 apply 1 2k_240               # 应用模板到 1 号显示器"
     Write-Host "  .\MonitorManager.ps1 disconnect 2                 # 断开 2 号显示器"
     Write-Host "  .\MonitorManager.ps1 connect 2                    # 重新连接 2 号显示器"
+    Write-Host "  .\MonitorManager.ps1 scene-save 办公              # 保存当前多屏状态"
+    Write-Host "  .\MonitorManager.ps1 scene-apply 单屏游戏          # 一键切换场景"
     Write-Host "  .\MonitorManager.ps1 templates                    # 列出所有显示器的模板"
     Write-Host "  .\MonitorManager.ps1 templates 1                  # 只看 1 号显示器的模板"
     Write-Host "  .\MonitorManager.ps1 delete 1 1080p_60"
@@ -5004,6 +6148,10 @@ try {
         'on'        { Set-MonitorPower $Arg1 'on' }
         'disconnect' { Set-MonitorPower $Arg1 'off' }
         'connect'    { Set-MonitorPower $Arg1 'on' }
+        'scene-save' { Save-MonitorScene $Arg1 }
+        'scene-apply' { Apply-MonitorScene $Arg1 }
+        'scenes'     { Show-MonitorScenes }
+        'scene-delete' { Remove-MonitorScene $Arg1 }
         'apply-worker' {
             try {
                 $workerMonitor = ConvertFrom-Base64Text $Arg1
@@ -5026,6 +6174,18 @@ try {
                 Complete-WorkerOutput -Records $workerRecords -Fallback '显示器状态切换完成'
             } catch {
                 $workerError = "后台显示器电源参数无效: $($_.Exception.Message)"
+                Write-Output $workerError
+                $script:CommandExitCode = 2
+                Write-WorkerResult -Message $workerError
+            }
+        }
+        'scene-worker' {
+            try {
+                $workerScene = ConvertFrom-Base64Text $Arg1
+                $workerRecords = @(& { Apply-MonitorScene $workerScene } *>&1)
+                Complete-WorkerOutput -Records $workerRecords -Fallback '场景切换完成'
+            } catch {
+                $workerError = "后台场景参数无效: $($_.Exception.Message)"
                 Write-Output $workerError
                 $script:CommandExitCode = 2
                 Write-WorkerResult -Message $workerError
