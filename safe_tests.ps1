@@ -77,8 +77,19 @@ $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('MonitorManager.SafeTests.' + 
 New-Item -Path $tempRoot -ItemType Directory -Force | Out-Null
 
 try {
+    $fakePwsh = Join-Path $tempRoot 'pwsh.exe'
+    $fakeWindowsPowerShell = Join-Path $tempRoot 'powershell.exe'
+    New-Item -Path $fakePwsh -ItemType File -Force | Out-Null
+    New-Item -Path $fakeWindowsPowerShell -ItemType File -Force | Out-Null
+    $preferredTestHost = Get-PreferredPowerShellHostPath -PowerShell7Candidates @($fakePwsh) -WindowsPowerShellCandidates @($fakeWindowsPowerShell)
+    Assert-True ($preferredTestHost -eq (Resolve-Path $fakePwsh).Path) 'PowerShell 7 is preferred when available'
+    Remove-Item -LiteralPath $fakePwsh -Force
+    $fallbackTestHost = Get-PreferredPowerShellHostPath -PowerShell7Candidates @($fakePwsh) -WindowsPowerShellCandidates @($fakeWindowsPowerShell)
+    Assert-True ($fallbackTestHost -eq (Resolve-Path $fakeWindowsPowerShell).Path) 'Windows PowerShell 5.1 is used when PowerShell 7 is unavailable'
+
     $script:TemplateDir = $tempRoot
     $script:TemplateFile = Join-Path $tempRoot 'templates.json'
+    $script:SceneFile = Join-Path $tempRoot 'scenes.json'
     $script:MonitorNamesFile = Join-Path $tempRoot 'monitor_names.json'
     $suffix = [Guid]::NewGuid().ToString('N')
     $script:DataMutexName = "Local\MonitorManager.SafeTests.Data.$suffix"
@@ -682,6 +693,135 @@ try {
     $verifyFailurePower = Invoke-MonitorPowerCoreUnlocked -MonitorSpec '2' -Operation off
     Assert-True (-not $verifyFailurePower.success -and [bool]$verifyFailurePower.result.rollbackAttempted) 'power-state verification failure triggers rollback'
     Assert-True ($script:PowerRestoreCalls -eq 1 -and [bool]$verifyFailurePower.result.rollbackSuccess) 'verification failure rollback is recorded'
+
+    # Multi-monitor scenes are exercised entirely through mocked display boundaries.
+    $monitorThree = New-TestPowerMonitor -TargetId 3 -SourceId 2 -Active $false
+    $script:PowerMonitors = @($monitorOne, $monitorTwo, $monitorThree)
+    $savedScene = Save-MonitorSceneCore -SceneName '  dual-work  '
+    Assert-True $savedScene.success ("current multi-monitor scene can be saved: " + ($savedScene | ConvertTo-Json -Depth 8 -Compress))
+    Assert-True ($savedScene.name -eq 'dual-work' -and $savedScene.activeCount -eq 2 -and $savedScene.monitorCount -eq 3) 'scene save trims name and records active/total counts'
+    $loadedScenes = Load-MonitorScenes
+    Assert-True (@($loadedScenes.scenes).Count -eq 1) 'scene file contains one scene'
+    Assert-True (@($loadedScenes.scenes[0].monitors | Where-Object { $_.isActive }).Count -eq 2) 'scene persists every monitor state'
+
+    $duplicateScene = Save-MonitorSceneCore -SceneName 'same-layout'
+    Assert-True (-not $duplicateScene.success -and [bool]$duplicateScene.duplicate) 'duplicate scene configuration is rejected under a different name'
+    Assert-True (@((Load-MonitorScenes).scenes).Count -eq 1) 'duplicate scene does not change the data file'
+
+    $validSceneJson = Get-Content -LiteralPath $script:SceneFile -Raw -Encoding UTF8
+    Set-Content -LiteralPath $script:SceneFile -Value '{broken' -Encoding UTF8
+    $corruptSceneBefore = Get-Content -LiteralPath $script:SceneFile -Raw -Encoding UTF8
+    $blockedSceneWrite = Save-MonitorSceneCore -SceneName 'must-not-overwrite'
+    $corruptSceneAfter = Get-Content -LiteralPath $script:SceneFile -Raw -Encoding UTF8
+    Assert-True (-not $blockedSceneWrite.success) 'write is blocked for corrupt scene data'
+    Assert-True ($corruptSceneAfter -eq $corruptSceneBefore) 'corrupt scene file remains untouched'
+    Assert-True (@(Get-ChildItem -LiteralPath $tempRoot -Filter 'scenes.json.corrupted.*.bak').Count -ge 1) 'corrupt scene backup exists'
+    Set-Content -LiteralPath $script:SceneFile -Value $validSceneJson -Encoding UTF8
+    $loadedScenes = Load-MonitorScenes
+
+    $allOffScene = [PSCustomObject]@{
+        version = 1
+        scenes = @([PSCustomObject]@{
+            name = 'unsafe'; created = '2026-01-01 00:00:00'
+            monitors = @([PSCustomObject]@{
+                monitorId = 'POWER-1'; monitorName = 'Power Monitor 1'; targetKey = (Get-MonitorTargetKey $monitorOne)
+                isActive = $false; width = 0; height = 0; refreshRate = 0; bitsPerPel = 0; dpiScale = 0
+            })
+        })
+    }
+    $allOffRejected = $false
+    try { Assert-SceneDataValid $allOffScene } catch { $allOffRejected = $true }
+    Assert-True $allOffRejected 'scene validation rejects a configuration that disables every display'
+
+    $inactiveOne = New-TestPowerMonitor -TargetId 1 -SourceId 0 -Active $false
+    $inactiveTwoForScene = New-TestPowerMonitor -TargetId 2 -SourceId 1 -Active $false
+    $activeThree = New-TestPowerMonitor -TargetId 3 -SourceId 2 -Active $true -Primary $true
+    $script:PowerMonitors = @($inactiveOne, $inactiveTwoForScene, $activeThree)
+    $script:PowerOriginalPaths = @((New-TestDisplayPath -SourceId 2 -TargetId 3 -Active $true))
+    $script:PowerAllPaths = @(
+        (New-TestDisplayPath -SourceId 0 -TargetId 1 -Active $false),
+        (New-TestDisplayPath -SourceId 1 -TargetId 2 -Active $false),
+        (New-TestDisplayPath -SourceId 2 -TargetId 3 -Active $true)
+    )
+    $scenePlan = Get-MonitorSceneTopologyPlan -Scene $loadedScenes.scenes[0] -CurrentMonitors $script:PowerMonitors `
+        -ActiveTopology @{ success = $true; paths = $script:PowerOriginalPaths } `
+        -AllTopology @{ success = $true; paths = $script:PowerAllPaths }
+    Assert-True $scenePlan.success 'scene plan resolves saved physical monitors against the current topology'
+    Assert-True ($scenePlan.paths.Count -eq 2) 'scene plan produces both desired active paths'
+    $plannedTargets = @($scenePlan.paths | ForEach-Object { Get-DisplayPathTargetKey $_ } | Sort-Object)
+    $expectedTargets = @((Get-MonitorTargetKey $inactiveOne), (Get-MonitorTargetKey $inactiveTwoForScene)) | Sort-Object
+    Assert-True (($plannedTargets -join '|') -eq ($expectedTargets -join '|')) 'scene plan turns on displays 1 and 2 and turns off display 3'
+
+    $activeFour = New-TestPowerMonitor -TargetId 4 -SourceId 3 -Active $true
+    $extraMonitorPlan = Get-MonitorSceneTopologyPlan -Scene $loadedScenes.scenes[0] -CurrentMonitors @($inactiveOne, $inactiveTwoForScene, $activeThree, $activeFour) `
+        -ActiveTopology @{ success = $true; paths = @((New-TestDisplayPath -SourceId 2 -TargetId 3 -Active $true), (New-TestDisplayPath -SourceId 3 -TargetId 4 -Active $true)) } `
+        -AllTopology @{ success = $true; paths = @($script:PowerAllPaths) + @((New-TestDisplayPath -SourceId 3 -TargetId 4 -Active $true)) }
+    $extraPlanTargets = @($extraMonitorPlan.paths | ForEach-Object { Get-DisplayPathTargetKey $_ })
+    Assert-True ($extraMonitorPlan.success -and $extraPlanTargets -contains (Get-MonitorTargetKey $activeFour)) 'active hardware added after scene creation remains enabled'
+
+    $cloneBlockedPlan = Get-MonitorSceneTopologyPlan -Scene $loadedScenes.scenes[0] -CurrentMonitors $script:PowerMonitors `
+        -ActiveTopology @{ success = $true; paths = $script:PowerOriginalPaths } `
+        -AllTopology @{ success = $true; paths = @(
+            (New-TestDisplayPath -SourceId 0 -TargetId 1 -Active $false),
+            (New-TestDisplayPath -SourceId 0 -TargetId 2 -Active $false),
+            (New-TestDisplayPath -SourceId 2 -TargetId 3 -Active $true)
+        ) }
+    Assert-True (-not $cloneBlockedPlan.success -and [bool]$cloneBlockedPlan.safetyBlocked) 'scene plan refuses to reuse one source for two independently controlled targets'
+
+    $missingPlan = Get-MonitorSceneTopologyPlan -Scene $loadedScenes.scenes[0] -CurrentMonitors @($inactiveOne, $activeThree) `
+        -ActiveTopology @{ success = $true; paths = $script:PowerOriginalPaths } `
+        -AllTopology @{ success = $true; paths = $script:PowerAllPaths }
+    Assert-True (-not $missingPlan.success -and $missingPlan.missingMonitor) 'scene plan fails before writes when saved hardware is missing'
+
+    $script:SceneSettingsCalls = 0
+    $script:SceneSettingsFailAt = 0
+    $script:SceneRestoreCalls = 0
+    function Get-CurrentDisplayModeSnapshot {
+        param([string]$DisplayName)
+        $mode = New-Object DEVMODE
+        $mode.dmSize = [Runtime.InteropServices.Marshal]::SizeOf([Type][DEVMODE])
+        $mode.dmPelsWidth = 1920; $mode.dmPelsHeight = 1080; $mode.dmDisplayFrequency = 60; $mode.dmBitsPerPel = 32
+        return @{ success = $true; mode = $mode }
+    }
+    function Wait-MonitorSceneState {
+        param([string[]]$ExpectedTargetKeys, [int]$Attempts = 8)
+        $activeOne = New-TestPowerMonitor -TargetId 1 -SourceId 0 -Active $true -Primary $true
+        $activeTwo = New-TestPowerMonitor -TargetId 2 -SourceId 1 -Active $true
+        $inactiveThree = New-TestPowerMonitor -TargetId 3 -SourceId 2 -Active $false
+        $script:PowerMonitors = @($activeOne, $activeTwo, $inactiveThree)
+        return @{ success = $true; monitors = @($script:PowerMonitors); activeCount = 2 }
+    }
+    function Invoke-ApplyTemplateCoreUnlocked {
+        param([string]$MonitorSpec, [string]$TemplateName, $DirectTemplate, $DirectTarget, [string]$OperationLabel)
+        $script:SceneSettingsCalls++
+        if ($script:SceneSettingsFailAt -eq $script:SceneSettingsCalls) { return @{ success = $false; error = 'test settings failure' } }
+        return @{ success = $true; allSuccess = $true; pendingRestart = $false; message = 'test settings applied' }
+    }
+    function Restore-MonitorSceneSnapshot {
+        param($TopologySnapshot, $DisplaySnapshots)
+        $script:SceneRestoreCalls++
+        return @{ success = $true; message = 'test scene rollback' }
+    }
+
+    $script:PowerChangeResult = @{ success = $true; code = 0; method = 'test' }
+    $script:PowerChangeCalls = 0
+    $sceneApplied = Invoke-ApplyMonitorSceneCoreUnlocked -SceneName 'dual-work'
+    Assert-True $sceneApplied.success ("scene apply succeeds through mocked topology and settings boundaries: " + ($sceneApplied | ConvertTo-Json -Depth 8 -Compress))
+    Assert-True ($script:PowerChangeCalls -eq 1 -and $script:PowerDesiredPaths.Count -eq 2) 'scene apply submits one atomic topology containing both active displays'
+    Assert-True ($script:SceneSettingsCalls -eq 2) 'scene apply restores settings for each active display'
+
+    $script:SceneSettingsCalls = 0
+    $script:SceneSettingsFailAt = 2
+    $script:SceneRestoreCalls = 0
+    $sceneSettingsFailure = Invoke-ApplyMonitorSceneCoreUnlocked -SceneName 'dual-work'
+    Assert-True (-not $sceneSettingsFailure.success -and [bool]$sceneSettingsFailure.result.rollbackAttempted) 'scene setting failure triggers whole-scene rollback'
+    Assert-True ($script:SceneRestoreCalls -eq 1 -and [bool]$sceneSettingsFailure.result.rollbackSuccess) 'whole-scene rollback result is reported'
+
+    function Wait-MonitorSceneState { throw 'test unexpected verification exception' }
+    $script:SceneRestoreCalls = 0
+    $unexpectedSceneFailure = Invoke-ApplyMonitorSceneCoreUnlocked -SceneName 'dual-work'
+    Assert-True (-not $unexpectedSceneFailure.success -and [bool]$unexpectedSceneFailure.result.rollbackAttempted) 'unexpected exception after a scene write still triggers rollback'
+    Assert-True ($script:SceneRestoreCalls -eq 1 -and [bool]$unexpectedSceneFailure.result.rollbackSuccess) 'unexpected-exception rollback is reported'
 
     Write-Output 'SAFE_TESTS_OK'
 } finally {

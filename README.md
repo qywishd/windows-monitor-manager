@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <em>A native PowerShell GUI tool for saving and switching per-monitor display configurations on Windows — resolution, refresh rate, color depth, and DPI scaling.</em>
+  <em>A native PowerShell GUI tool for saving per-monitor profiles and switching complete multi-monitor scenes on Windows.</em>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-blue" alt="Platform">
-  <img src="https://img.shields.io/badge/powershell-5.1%2B-blue" alt="PowerShell">
+  <img src="https://img.shields.io/badge/PowerShell-7%20preferred%20%7C%205.1%20compatible-blue" alt="PowerShell">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
-  <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.1.0-blue" alt="Version">
 </p>
 
 ---
@@ -27,11 +27,12 @@
 
 - 识别已连接显示器的分辨率、刷新率、颜色深度和 DPI 缩放
 - 按**单个显示器**保存配置模板（不影响其他显示器）
+- 保存**多显示器场景**，一键切换多台显示器的连接状态与显示参数
 - 一键切换模板（GUI / CLI / 交互菜单）
 - 单独连接或断开显示器（等同 Windows"扩展桌面/断开此显示器"）
 - 安全回滚：应用失败时自动恢复原始配置
 
-无需安装任何第三方依赖，Windows 10/11 自带 PowerShell 5.1 即可运行。
+优先使用 PowerShell 7；未安装时会自动回退到 Windows 10/11 自带的 PowerShell 5.1，无需第三方模块。
 
 **Windows Monitor Manager** is a native PowerShell + WinForms GUI tool that lets you save per-monitor display profiles (resolution, refresh rate, color depth, DPI scaling) and switch between them instantly — all without third-party dependencies.
 
@@ -43,6 +44,7 @@
 |------|------|
 | 🖥️ **显示器识别** | 检测所有已连接显示器及其当前分辨率、刷新率、色深、DPI 缩放 |
 | 💾 **单显示器模板** | 为每台显示器独立保存配置，互不影响 |
+| 🎛️ **多显示器场景** | 保存全部显示器的开/关状态，并一键恢复活动显示器的分辨率、刷新率、色深和缩放 |
 | ⚡ **一键应用** | GUI 双击或 CLI 命令快速切换模板 |
 | 🔌 **连接/断开** | 从 Windows 桌面单独断开或重新连接指定显示器 |
 | 🔒 **安全保护** | 拒绝断开最后一台活动显示器；应用失败自动回滚 |
@@ -64,7 +66,7 @@
 | 项目 | 要求 |
 |------|------|
 | 操作系统 | Windows 10 / Windows 11 |
-| PowerShell | 5.1 或更高版本（Windows 自带） |
+| PowerShell | 推荐 7；兼容 Windows PowerShell 5.1 |
 | 权限 | 当前用户权限即可（无需管理员） |
 | 依赖 | 无任何第三方依赖 |
 
@@ -85,6 +87,8 @@
 
 > **提示：** 首次运行建议执行 `.\MonitorManager.ps1 shortcut` 创建桌面快捷方式，之后双击即可启动 GUI。
 
+程序的 GUI 后台任务和新建桌面快捷方式会优先使用 `pwsh.exe`（PowerShell 7），找不到时自动回退到 `powershell.exe`（Windows PowerShell 5.1）。修改系统默认终端不是必要条件；升级旧版本后可重新运行 `shortcut` 更新已有快捷方式。
+
 ---
 
 ## 📋 使用方法 / Usage
@@ -101,6 +105,7 @@
 4. 点击 **+ 添加模板** → 保存当前配置
 5. 点击 ⏻ 电源按钮 → 连接/断开该显示器
 6. 点击 ✎ 铅笔按钮 → 重命名显示器
+7. 点击 **多屏场景** → 保存当前多屏配置，或一键切换已有场景
 
 ### CLI 命令行
 
@@ -119,6 +124,16 @@
 
 # 重新连接 2 号显示器
 .\MonitorManager.ps1 connect 2
+
+# 保存当前全部显示器为“办公”场景
+.\MonitorManager.ps1 scene-save 办公
+
+# 一键切换到“单屏游戏”场景
+.\MonitorManager.ps1 scene-apply 单屏游戏
+
+# 列出或删除多显示器场景
+.\MonitorManager.ps1 scenes
+.\MonitorManager.ps1 scene-delete 办公
 
 # 列出所有模板
 .\MonitorManager.ps1 templates
@@ -153,6 +168,7 @@
 ```
 %USERPROFILE%\.monitormanager\
 ├── templates.json        # 模板数据（按显示器 ID 分组）
+├── scenes.json           # 多显示器场景（连接状态与活动显示参数）
 └── monitor_names.json    # 自定义显示器名称
 ```
 
@@ -174,6 +190,7 @@
 - DPI 设置后**独立回读验证**
 - 任一步骤失败 → **自动恢复原始模式 + 原始 DPI**
 - 回滚本身也经过**多次轮询验证**
+- 场景切换先一次性提交最终拓扑，再逐台恢复显示参数；任一步失败会尝试恢复切换前的完整拓扑和活动显示器快照
 
 ### 数据完整性
 - 所有文件写入使用 **临时文件 + 原子 Move**，防止中断损坏
@@ -181,7 +198,7 @@
 - 多实例通过**命名互斥锁**串行化读写
 
 ### 并发保护
-- 数据互斥锁：保护 `templates.json` 和 `monitor_names.json` 的读写
+- 数据互斥锁：保护 `templates.json`、`scenes.json` 和 `monitor_names.json` 的读写
 - 显示互斥锁：保护显示器模式切换，避免并发写入显示配置
 
 ---
@@ -213,20 +230,23 @@ A: 这通常发生在某些特殊的显示配置下。如果是覆盖已有模�
 4. **不支持 GPU 颜色设置** — 如 NVIDIA 控制面板中的颜色调整
 5. **刷新率 1Hz 回读误差** — 部分显示器/驱动回读刷新率可能与设定值差 1Hz，模板匹配已容差处理
 6. **DisplayConfig 逆向 API** — 部分 DPI 功能使用了未公开的 `DisplayConfigGetDeviceInfo` type 值（-3/-4），未来 Windows 更新可能改变行为
+7. **场景不保存桌面布局** — v1.1.0 场景保存连接状态和显示参数，不改变显示器位置、旋转、主显示器或扩展/复制模式；复制模式下缺少独立显示源时会安全拒绝切换
 
 ---
 
 ## 🧪 测试 / Testing
 
-### 运行语法检查
+### PowerShell 7（推荐）
+
+```powershell
+pwsh.exe -NoProfile -File .\check_syntax.ps1
+pwsh.exe -NoProfile -File .\safe_tests.ps1
+```
+
+### Windows PowerShell 5.1 兼容验证
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\check_syntax.ps1
-```
-
-### 运行安全测试
-
-```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\safe_tests.ps1
 ```
 
@@ -254,6 +274,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\MonitorManager.ps1 lis
 | 模板应用/回滚 | 提交失败回滚、模式验证失败回滚、DPI 失败回滚 |
 | DPI 设置 | 设置验证、偏移计算、回读不匹配回滚 |
 | 显示器电源 | 断开/连接逻辑、最后显示器保护、空闲源检测 |
+| 多显示器场景 | 保存/去重、物理目标映射、原子拓扑规划、缺失硬件保护、整场景回滚 |
 | 拓扑操作 | Path-only 拓扑、数据库回退、快照恢复 |
 | 数据完整性 | 损坏文件备份、无效 JSON 拒绝写入、旧格式迁移 |
 | 闭包安全 | `GetNewClosure` 不访问 `$script:` 状态 |
@@ -293,6 +314,13 @@ Copyright (c) 2026 qywishd
 ## 📝 更新日志 / Changelog
 
 详见 [CHANGELOG.md](CHANGELOG.md)。
+
+### v1.1.0 (2026-08-15)
+
+- 新增多显示器场景保存、管理与一键切换
+- 场景切换失败时恢复原始拓扑与显示参数
+- 新增 GUI 场景管理窗口及 `scene-*` CLI 命令
+- GUI 后台进程和桌面快捷方式优先使用 PowerShell 7，缺失时回退到 5.1
 
 ### v1.0.0 (2026-07-21)
 

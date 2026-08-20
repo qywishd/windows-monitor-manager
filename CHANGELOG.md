@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.0] - 2026-08-15
+
+### Added
+
+- Multi-monitor scenes that save every detected display's active/inactive state
+- Saved resolution, refresh rate, color depth, and DPI scale for active displays in each scene
+- GUI scene manager for save, overwrite, apply, and delete operations
+- CLI commands: `scene-save`, `scene-apply`, `scenes`, and `scene-delete`
+- Duplicate scene-configuration detection
+
+### Safety
+
+- Atomic final-topology planning instead of sequentially disconnecting displays
+- Last-display guard for scene files and runtime plans
+- Physical target identity mapping with MonitorId fallback after reboot or driver re-enumeration
+- Missing-hardware and clone-source validation before any display write
+- Whole-scene rollback of the original topology and active display mode snapshots
+- Safe mocked tests for scene persistence, topology planning, hardware mismatch, application, and rollback
+
+### Changed
+
+- GUI and documentation version updated to 1.1.0
+- User data now also includes `%USERPROFILE%\.monitormanager\scenes.json`
+- GUI workers and newly generated desktop shortcuts now prefer PowerShell 7 (`pwsh.exe`) and fall back to Windows PowerShell 5.1
+- CI validates the full safe suite under both PowerShell 7 and Windows PowerShell 5.1
+
+### Fixed
+
+- Existing desktop shortcuts can now be atomically replaced on Windows by using a real backup path with `File.Replace`
+- Multi-monitor scene dialogs now use a DPI-aware responsive layout with clearer labels and spacing
+
 ## [1.0.0] - 2026-07-21
 
 ### Added
